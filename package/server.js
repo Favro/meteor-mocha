@@ -62,6 +62,33 @@ function printHeader(type) {
   }
 }
 
+// Listeners registered via onHookFail(cb). Called synchronously from mocha's
+// runner 'fail' event whenever a hook (before/beforeEach/after/afterEach)
+// fails or times out. This is the only reliable place to clean up global
+// side effects installed in a `before` hook, because mocha does NOT run the
+// paired `after` hook after a `before` failure -- so a sinon sandbox set up
+// at the top of a failing `before` leaks across every subsequent describe
+// in the same process. See:
+//   MainApp/server/unittests/_helpers/trackedsandbox.ts
+// for the sandbox registry that drains here.
+const hookFailListeners = [];
+
+function notifyHookFailListeners(runnable, err) {
+  for (const listener of hookFailListeners) {
+    try {
+      listener(runnable, err);
+    } catch (listenerError) {
+      // Listeners are cleanup; swallow their errors so one broken listener
+      // doesn't prevent others from running or derail the test run.
+      console.error('[meteortesting:mocha] Hook-fail listener threw:', listenerError);
+    }
+  }
+}
+
+function onHookFail(listener) {
+  hookFailListeners.push(listener);
+}
+
 let callCount = 0;
 let clientFailures = 0;
 let serverFailures = 0;
@@ -128,7 +155,7 @@ function serverTests(cb) {
     output: serverOutput,
   });
 
-  mochaInstance.run((failureCount) => {
+  const runner = mochaInstance.run((failureCount) => {
     if (typeof failureCount !== 'number') {
       console.log(
         'Mocha did not return a failure count for server tests as expected',
@@ -138,6 +165,16 @@ function serverTests(cb) {
       exitIfDone('server', failureCount);
     }
     if (cb) cb();
+  });
+
+  // Attach the hook-fail listener forwarder. Mocha's 'fail' event fires
+  // synchronously for both tests and hooks; we filter to hook failures
+  // (including "before all" / "before each" timeouts) and forward to any
+  // registered cleanup listeners. This runs BEFORE mocha proceeds to the
+  // next describe, so cleanup happens in-order instead of leaking past it.
+  runner.on('fail', (runnable, err) => {
+    if (runnable && runnable.type === 'hook')
+      notifyHookFailListeners(runnable, err);
   });
 }
 
@@ -240,7 +277,7 @@ async function start() {
   }
 }
 
-export { start };
+export { start, onHookFail };
 
 onMessage('client-refresh', (options) => {
   console.log(
